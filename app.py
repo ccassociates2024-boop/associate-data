@@ -281,56 +281,223 @@ st.markdown("""
 # SECTION 1 — PDF EXTRACTION (logic)
 # ─────────────────────────────────────────────
 
+# All known column name variants across Indian banks
+# (HDFC, SBI, ICICI, Axis, Kotak, Yes Bank, PNB, BOB, Canara…)
+DATE_KEYWORDS    = ["date", "dt", "txn date", "tran date", "value dt",
+                    "value date", "posting date", "trans date", "transaction date"]
+DESC_KEYWORDS    = ["description", "narration", "particulars", "particular",
+                    "narr", "desc", "details", "remarks", "transaction details",
+                    "transaction remarks", "chq", "ref"]
+DEBIT_KEYWORDS   = ["debit", "withdrawal", "withdraw", "dr", "debit amt",
+                    "debit amount", "withdrawal amt", "amount debited",
+                    "withdrawals", "paid out", "debit(inr)", "debit(₹)"]
+CREDIT_KEYWORDS  = ["credit", "deposit", "cr", "credit amt", "credit amount",
+                    "deposit amt", "amount credited", "deposits",
+                    "paid in", "credit(inr)", "credit(₹)"]
+BALANCE_KEYWORDS = ["balance", "bal", "closing balance", "closing bal",
+                    "running balance", "available balance", "ledger balance"]
+
+
+def _col_matches(col_text: str, keywords: list[str]) -> bool:
+    """Check if a column header matches any of the given keyword patterns."""
+    col_clean = col_text.lower().strip()
+    return any(kw in col_clean for kw in keywords)
+
+
 def extract_tables_from_pdf(uploaded_file: io.BytesIO) -> list[pd.DataFrame]:
-    """Extract all tables found across every page of the PDF."""
+    """
+    Try three strategies to pull tables from the PDF:
+    1. Default pdfplumber extract_tables()
+    2. Relaxed table settings (catches borderless / line-less tables)
+    3. extract_text() based row parsing as last resort
+    Returns a list of raw DataFrames.
+    """
     frames = []
+
+    # Strategy 1 & 2 — table extraction with two setting profiles
+    table_settings_list = [
+        {},   # default
+        {     # relaxed — works for tables with no visible borders
+            "vertical_strategy":   "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance":       5,
+            "join_tolerance":       5,
+            "edge_min_length":      10,
+            "min_words_vertical":   2,
+            "min_words_horizontal": 1,
+        },
+        {     # lines-only strategy for PDFs with just line separators
+            "vertical_strategy":   "lines",
+            "horizontal_strategy": "lines",
+        },
+    ]
+
     with pdfplumber.open(uploaded_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                if table:
-                    frames.append(pd.DataFrame(table))
-    return frames
+            found_any = False
+            for settings in table_settings_list:
+                try:
+                    tables = page.extract_tables(settings) if settings else page.extract_tables()
+                    for table in tables:
+                        if table and len(table) > 1:
+                            frames.append(pd.DataFrame(table))
+                            found_any = True
+                except Exception:
+                    continue
+                if found_any:
+                    break
+
+            # Strategy 3 — text-line fallback if no tables found on this page
+            if not found_any:
+                text = page.extract_text()
+                if text:
+                    frames.append(_text_to_dataframe(text))
+
+    return [f for f in frames if f is not None and not f.empty]
 
 
-def detect_header_row(df: pd.DataFrame, keywords: list[str]) -> int | None:
-    """Find the row index that best matches column header keywords."""
+def _text_to_dataframe(text: str) -> pd.DataFrame | None:
+    """
+    Parse raw page text into a DataFrame by detecting lines that start
+    with a date pattern. Covers DD/MM/YYYY, DD-MM-YYYY, DD MMM YYYY,
+    YYYY-MM-DD formats common in Indian bank statements.
+    """
+    date_pattern = re.compile(
+        r"^(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}"        # DD/MM/YYYY or DD-MM-YY
+        r"|\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|"       # DD MMM YYYY
+        r"Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{2,4}"
+        r"|\d{4}[\/\-]\d{2}[\/\-]\d{2})",               # YYYY-MM-DD
+        re.IGNORECASE,
+    )
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if date_pattern.match(line):
+            rows.append(line)
+
+    if not rows:
+        return None
+
+    # Try to split each row into columns using 2+ whitespace as delimiter
+    split_rows = [re.split(r"\s{2,}", r) for r in rows]
+    max_cols = max(len(r) for r in split_rows)
+    # Pad shorter rows
+    split_rows = [r + [""] * (max_cols - len(r)) for r in split_rows]
+    return pd.DataFrame(split_rows)
+
+
+def detect_header_row(df: pd.DataFrame) -> int | None:
+    """
+    Find the row whose cells best match known date/desc/debit/credit/balance
+    keywords. Returns row index or None. Score threshold = 2.
+    """
+    all_keywords = (DATE_KEYWORDS + DESC_KEYWORDS + DEBIT_KEYWORDS +
+                    CREDIT_KEYWORDS + BALANCE_KEYWORDS)
     best_row, best_score = None, 0
     for i, row in df.iterrows():
         row_str = " ".join(str(v).lower() for v in row.values if v)
-        score = sum(1 for kw in keywords if kw in row_str)
+        score = sum(1 for kw in all_keywords if kw in row_str)
         if score > best_score:
             best_score, best_row = score, i
     return best_row if best_score >= 2 else None
 
 
-def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
-    """Identify and normalize the transaction table from raw extracted frames."""
-    keywords = ["date", "description", "debit", "credit", "balance"]
-    for df in frames:
-        header_idx = detect_header_row(df, keywords)
-        if header_idx is None:
+def _map_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Rename extracted columns to standard names:
+    Date | Description | Debit | Credit | Balance
+    Unknown columns are dropped (e.g. Chq No, Branch Code).
+    """
+    col_map = {}
+    for col in df.columns:
+        col_lower = str(col).lower().strip()
+        if col in col_map:
             continue
-        df.columns = [str(v).strip().lower() if v else f"col_{i}"
-                      for i, v in enumerate(df.iloc[header_idx])]
+        if _col_matches(col_lower, DATE_KEYWORDS) and "Date" not in col_map.values():
+            col_map[col] = "Date"
+        elif _col_matches(col_lower, DESC_KEYWORDS) and "Description" not in col_map.values():
+            col_map[col] = "Description"
+        elif _col_matches(col_lower, DEBIT_KEYWORDS) and "Debit" not in col_map.values():
+            col_map[col] = "Debit"
+        elif _col_matches(col_lower, CREDIT_KEYWORDS) and "Credit" not in col_map.values():
+            col_map[col] = "Credit"
+        elif _col_matches(col_lower, BALANCE_KEYWORDS) and "Balance" not in col_map.values():
+            col_map[col] = "Balance"
+
+    df = df.rename(columns=col_map)
+    for required in ["Date", "Description", "Debit", "Credit", "Balance"]:
+        if required not in df.columns:
+            df[required] = ""
+    return df[["Date", "Description", "Debit", "Credit", "Balance"]]
+
+
+def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
+    """
+    From all extracted frames, find the one that looks like a transaction
+    table, promote its header, map columns to standard names, and return
+    a clean DataFrame.
+    """
+    all_parts = []
+
+    for df in frames:
+        header_idx = detect_header_row(df)
+
+        if header_idx is None:
+            # No header found — might be a continuation page (no header row repeated)
+            # Try mapping columns positionally if it looks like transaction data
+            if len(df.columns) >= 4:
+                # Check if first column has date-like values
+                first_col = df.iloc[:, 0].astype(str)
+                date_like = first_col.str.match(
+                    r"\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\/\-]\d{2}[\/\-]\d{2}"
+                ).sum()
+                if date_like >= 2:
+                    # Assume positional: Date, Description, Debit, Credit[, Balance]
+                    part = df.copy()
+                    cols = list(df.columns)
+                    rename = {}
+                    if len(cols) >= 1: rename[cols[0]] = "Date"
+                    if len(cols) >= 2: rename[cols[1]] = "Description"
+                    if len(cols) >= 3: rename[cols[2]] = "Debit"
+                    if len(cols) >= 4: rename[cols[3]] = "Credit"
+                    if len(cols) >= 5: rename[cols[4]] = "Balance"
+                    part = part.rename(columns=rename)
+                    for req in ["Date","Description","Debit","Credit","Balance"]:
+                        if req not in part.columns:
+                            part[req] = ""
+                    all_parts.append(part[["Date","Description","Debit","Credit","Balance"]])
+            continue
+
+        # Promote header row as column names (handle newlines in cell text)
+        new_cols = []
+        for v in df.iloc[header_idx]:
+            clean = re.sub(r"\s+", " ", str(v)).strip().lower() if v else ""
+            new_cols.append(clean)
+        df.columns = new_cols
         df = df.iloc[header_idx + 1:].reset_index(drop=True)
         df = df.dropna(how="all")
         df = df[df.apply(lambda r: r.astype(str).str.strip().ne("").any(), axis=1)]
+        mapped = _map_columns(df)
+        all_parts.append(mapped)
 
-        col_map = {}
-        for col in df.columns:
-            if "date" in col:                                        col_map[col] = "Date"
-            elif "desc" in col or "narr" in col or "particular" in col: col_map[col] = "Description"
-            elif "debit" in col or "dr" in col or "withdrawal" in col:  col_map[col] = "Debit"
-            elif "credit" in col or "cr" in col or "deposit" in col:    col_map[col] = "Credit"
-            elif "balance" in col or "bal" in col:                      col_map[col] = "Balance"
+    if not all_parts:
+        return None
 
-        df = df.rename(columns=col_map)
-        for required in ["Date", "Description", "Debit", "Credit", "Balance"]:
-            if required not in df.columns:
-                df[required] = ""
-        return df[["Date", "Description", "Debit", "Credit", "Balance"]]
-    return None
+    combined = pd.concat(all_parts, ignore_index=True)
+
+    # Drop rows where Date AND Description are both empty
+    combined = combined[
+        ~(combined["Date"].astype(str).str.strip().eq("") &
+          combined["Description"].astype(str).str.strip().eq(""))
+    ]
+
+    # Drop rows that look like repeated headers
+    header_like = combined["Date"].astype(str).str.lower().str.contains(
+        "date|dt|txn", na=False
+    )
+    combined = combined[~header_like]
+
+    return combined.reset_index(drop=True) if not combined.empty else None
 
 
 # ─────────────────────────────────────────────
@@ -347,14 +514,31 @@ def clean_amount(value) -> float:
 
 
 def standardize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Convert raw columns into Date | Description | Amount | Type format."""
+    """
+    Convert raw columns into Date | Description | Amount | Type format.
+    Handles:
+    - Rows with only Debit filled (ICICI, Axis)
+    - Rows with only Credit filled
+    - Rows with both Debit and Credit in same row (HDFC style)
+    - Rows where a single Amount column exists with Dr/Cr suffix
+    """
     rows = []
     for _, row in df.iterrows():
-        debit  = clean_amount(row.get("Debit", ""))
+        date_val = str(row.get("Date", "")).strip()
+        desc_val = str(row.get("Description", "")).strip()
+        if not date_val or not desc_val:
+            continue
+
+        debit  = clean_amount(row.get("Debit",  ""))
         credit = clean_amount(row.get("Credit", ""))
-        base   = {"Date": str(row.get("Date", "")).strip(),
-                  "Description": str(row.get("Description", "")).strip()}
-        if debit > 0:
+        base   = {"Date": date_val, "Description": desc_val}
+
+        if debit > 0 and credit > 0:
+            # Both filled (some formats put the non-applicable as 0.00 but both exist)
+            # Use balance direction heuristic — just add both as separate entries
+            rows.append({**base, "Amount": debit,  "Type": "Debit"})
+            rows.append({**base, "Amount": credit, "Type": "Credit"})
+        elif debit > 0:
             rows.append({**base, "Amount": debit,  "Type": "Debit"})
         elif credit > 0:
             rows.append({**base, "Amount": credit, "Type": "Credit"})
