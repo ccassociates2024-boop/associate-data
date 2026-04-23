@@ -210,7 +210,13 @@ div[data-testid="metric-container"]::before {
     overflow: hidden !important;
     border: 1px solid #1e293b !important;
 }
-.dvn-scroller { background: #111827 !important; }
+/* Keep data editor text visible in dark theme */
+.stDataEditor [data-testid="glideDataEditor"] { background: #111827 !important; }
+.stDataEditor canvas { background: #111827 !important; }
+/* Streamlit dataframe table text */
+[data-testid="stDataFrame"] table { color: #e2e8f0 !important; background: #111827 !important; }
+[data-testid="stDataFrame"] th { background: #1e293b !important; color: #818cf8 !important; font-weight:700; }
+[data-testid="stDataFrame"] td { color: #cbd5e1 !important; border-color: #1e293b !important; }
 
 /* ── Divider ── */
 .divider { border: none; border-top: 1px solid #1e293b; margin: 1.8rem 0; }
@@ -391,77 +397,94 @@ def _assign_col(col_name: str) -> str | None:
     return None
 
 
-def _normalize_one(df: pd.DataFrame) -> pd.DataFrame | None:
+def _extract_col_positions(df: pd.DataFrame, header_idx: int) -> dict[int, str]:
     """
-    Normalise a single raw DataFrame into:
-    Date | Description | Debit | Credit | Balance
-    Returns None if the frame doesn't look like a transaction table.
+    From the header row at header_idx, return a dict mapping
+    column position → standard name.  Only the FIRST match per
+    standard name is kept so we never get duplicate columns.
     """
-    header_idx = _find_header(df)
+    pos_map: dict[int, str] = {}
+    used: set[str] = set()
+    for i, v in enumerate(df.iloc[header_idx]):
+        flat = re.sub(r"\s+", " ", str(v)).strip() if v else ""
+        std  = _assign_col(flat)
+        if std and std not in used:
+            pos_map[i] = std
+            used.add(std)
+    return pos_map
 
-    if header_idx is not None:
-        # Flatten newlines in header cell text
-        raw_headers = [
-            re.sub(r"\s+", " ", str(v)).strip() if v else f"_c{i}"
-            for i, v in enumerate(df.iloc[header_idx])
-        ]
-        df = df.iloc[header_idx + 1:].copy()
-        df.columns = raw_headers
-    else:
-        # No header row — try positional assignment if col-0 looks like dates
-        first = df.iloc[:, 0].astype(str)
-        date_hits = first.str.match(
-            r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|^\d{4}[\/\-]\d{2}[\/\-]\d{2}"
-        ).sum()
-        if date_hits < 2 or len(df.columns) < 3:
-            return None
-        positional = ["Date", "Description", "Debit", "Credit", "Balance"]
-        df = df.copy()
-        df.columns = [positional[i] if i < len(positional) else f"_x{i}"
-                      for i in range(len(df.columns))]
 
-    # Map columns — keep only the first match per standard name
-    seen: dict[str, str] = {}   # standard_name -> original col
-    for col in df.columns:
-        std = _assign_col(str(col))
-        if std and std not in seen:
-            seen[std] = col
-
-    # Build clean DataFrame with exactly 5 standard columns
-    result = pd.DataFrame()
-    for std in ["Date", "Description", "Debit", "Credit", "Balance"]:
-        if std in seen:
-            result[std] = df[seen[std]].reset_index(drop=True)
-        else:
-            result[std] = ""
-
-    # Clean up
-    result = result.dropna(how="all")
-    result = result[result.apply(
-        lambda r: r.astype(str).str.strip().ne("").any(), axis=1
-    )]
-    # Remove repeated header rows (e.g. printed on every page)
-    is_header = result["Date"].astype(str).str.lower().str.match(
-        r"^(date|dt|txn|tran|value|posting)"
+def _apply_col_positions(df: pd.DataFrame,
+                         pos_map: dict[int, str]) -> pd.DataFrame | None:
+    """
+    Given a data DataFrame (no header row) and a column-position → standard-name
+    map, build a clean 5-column DataFrame.
+    """
+    result = {}
+    for pos, std in pos_map.items():
+        if pos < len(df.columns):
+            result[std] = df.iloc[:, pos].reset_index(drop=True)
+    if "Date" not in result:
+        return None
+    for req in ["Date", "Description", "Debit", "Credit", "Balance"]:
+        if req not in result:
+            result[req] = ""
+    out = pd.DataFrame(result)[["Date", "Description", "Debit", "Credit", "Balance"]]
+    # Drop repeated header rows that some banks print on every page
+    is_hdr = out["Date"].astype(str).str.lower().str.match(
+        r"^(date|dt|txn|tran|value|posting|sl\.)"
     )
-    result = result[~is_header]
-
-    return result.reset_index(drop=True) if not result.empty else None
+    out = out[~is_hdr].dropna(how="all").reset_index(drop=True)
+    return out if not out.empty else None
 
 
 def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
     """
-    Process all raw frames → normalise each independently → concat results.
-    Each part is guaranteed to have exactly [Date, Description, Debit, Credit, Balance]
-    before concat, eliminating any duplicate-column issues.
+    Strategy:
+    1. Scan ALL frames to find the best header row and learn the column layout.
+    2. Apply that SAME column-position map to every frame (including
+       continuation pages that have no header).
+    This ensures Debit/Credit/Balance are always mapped correctly on every page.
     """
+    # ── Step 1: find column layout from any frame that has a header ──────────
+    master_pos_map: dict[int, str] | None = None
+
+    for df in frames:
+        h = _find_header(df)
+        if h is not None:
+            candidate = _extract_col_positions(df, h)
+            # Accept layout only if it has at least Date + one amount column
+            has_amount = any(v in ("Debit", "Credit") for v in candidate.values())
+            if candidate and has_amount:
+                master_pos_map = candidate
+                break   # first valid header wins
+
+    # ── Step 2: fall back to smart positional if no header found ─────────────
+    if master_pos_map is None:
+        # Try the frame whose first column looks most like dates
+        for df in frames:
+            if df.empty or len(df.columns) < 3:
+                continue
+            first = df.iloc[:, 0].astype(str)
+            hits  = first.str.match(
+                r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|^\d{4}[\/\-]\d{2}[\/\-]\d{2}"
+            ).sum()
+            if hits >= 2:
+                # Detect amount columns by checking which cols have numeric values
+                master_pos_map = _detect_amount_positions(df)
+                if master_pos_map:
+                    break
+        if not master_pos_map:
+            return None
+
+    # ── Step 3: apply layout to every frame ──────────────────────────────────
     parts = []
     for df in frames:
         try:
-            norm = _normalize_one(df)
+            h = _find_header(df)
+            data = df.iloc[h + 1:].copy().reset_index(drop=True) if h is not None else df.copy()
+            norm = _apply_col_positions(data, master_pos_map)
             if norm is not None and not norm.empty:
-                # Guarantee column order and no duplicates
-                norm = norm[["Date", "Description", "Debit", "Credit", "Balance"]]
                 parts.append(norm)
         except Exception:
             continue
@@ -470,18 +493,53 @@ def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
         return None
 
     combined = pd.concat(parts, ignore_index=True)
-
-    # Ensure columns are plain strings (guards against edge-case dtype issues)
     combined.columns = ["Date", "Description", "Debit", "Credit", "Balance"]
 
-    # Drop fully empty rows
-    mask_empty = (
-        combined["Date"].astype(str).str.strip().isin(["", "None", "nan"]) &
-        combined["Description"].astype(str).str.strip().isin(["", "None", "nan"])
-    )
-    combined = combined[~mask_empty].reset_index(drop=True)
+    # Drop rows where both Date and Description are empty/null
+    d_empty = combined["Date"].astype(str).str.strip().isin(["", "None", "nan"])
+    r_empty = combined["Description"].astype(str).str.strip().isin(["", "None", "nan"])
+    combined = combined[~(d_empty & r_empty)].reset_index(drop=True)
 
     return combined if not combined.empty else None
+
+
+def _detect_amount_positions(df: pd.DataFrame) -> dict[int, str]:
+    """
+    For PDFs with no header, infer column roles by checking which
+    columns contain mostly numeric values. Assigns:
+      col[0]  → Date  (already verified date-like)
+      col[1]  → Description (usually longest text)
+      last    → Balance  (running total, always non-zero)
+      numeric cols before last → Debit then Credit
+    """
+    pos_map: dict[int, str] = {0: "Date", 1: "Description"}
+    n = len(df.columns)
+    if n < 3:
+        return pos_map
+
+    def num_score(col_idx: int) -> float:
+        vals = df.iloc[:, col_idx].astype(str)
+        numeric = vals.str.replace(r"[,₹\s]", "", regex=True).str.match(r"^\d+\.?\d*$")
+        return numeric.sum() / max(len(vals), 1)
+
+    # Find columns with high numeric density (skip col 0 and 1)
+    numeric_cols = sorted(
+        [i for i in range(2, n) if num_score(i) > 0.3],
+        key=lambda i: num_score(i), reverse=True
+    )
+
+    if len(numeric_cols) >= 3:
+        # e.g. [Debit_col, Credit_col, Balance_col]
+        pos_map[numeric_cols[-1]] = "Balance"
+        pos_map[numeric_cols[0]]  = "Debit"
+        pos_map[numeric_cols[1]]  = "Credit"
+    elif len(numeric_cols) == 2:
+        pos_map[numeric_cols[0]] = "Debit"
+        pos_map[numeric_cols[1]] = "Balance"
+    elif len(numeric_cols) == 1:
+        pos_map[numeric_cols[0]] = "Debit"
+
+    return pos_map
 
 
 # ─────────────────────────────────────────────
@@ -603,22 +661,68 @@ def build_excel(df: pd.DataFrame) -> bytes:
         export.to_excel(writer, index=False, sheet_name="Bank Statement")
         ws = writer.sheets["Bank Statement"]
         from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-        header_fill = PatternFill("solid", fgColor="0F1117")
-        header_font = Font(bold=True, color="818CF8", size=11)
-        thin_border = Border(bottom=Side(style="thin", color="1E293B"))
-        col_widths  = {"A": 14, "B": 45, "C": 22, "D": 18, "E": 14, "F": 14}
-        for col, w in col_widths.items():
-            ws.column_dimensions[col].width = w
+
+        # ── White/light professional theme ──────────────────────────────────
+        header_fill  = PatternFill("solid", fgColor="1E3A5F")   # dark navy header
+        header_font  = Font(bold=True, color="FFFFFF", size=11)  # white text
+        center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left_align   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+        alt_fill     = PatternFill("solid", fgColor="EBF3FB")    # light blue alt rows
+        white_fill   = PatternFill("solid", fgColor="FFFFFF")    # white base rows
+
+        # Category-colour fills for the Category column (col D = index 4)
+        cat_fills = {
+            "Tax":           PatternFill("solid", fgColor="FFF8E1"),
+            "Expense":       PatternFill("solid", fgColor="FFEBEE"),
+            "Purchase":      PatternFill("solid", fgColor="E3F2FD"),
+            "Income":        PatternFill("solid", fgColor="E8F5E9"),
+            "Uncategorized": PatternFill("solid", fgColor="F5F5F5"),
+        }
+
+        thin  = Side(style="thin",   color="BFCFDF")
+        thick = Side(style="medium", color="1E3A5F")
+        header_border = Border(bottom=thick)
+        row_border    = Border(
+            top=thin, bottom=thin, left=thin, right=thin
+        )
+
+        col_widths = {"A": 13, "B": 46, "C": 24, "D": 18, "E": 14, "F": 14}
+        for col_letter, w in col_widths.items():
+            ws.column_dimensions[col_letter].width = w
+        ws.row_dimensions[1].height = 22
+
+        # Header row
         for cell in ws[1]:
             cell.fill      = header_fill
             cell.font      = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-        alt_fill = PatternFill("solid", fgColor="111827")
+            cell.alignment = center_align
+            cell.border    = header_border
+
+        # Data rows
+        cat_col_idx = export.columns.get_loc("Category") + 1  # 1-based
         for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+            is_alt = (row_idx % 2 == 0)
             for cell in row:
-                cell.border = thin_border
-                if row_idx % 2 == 0:
-                    cell.fill = alt_fill
+                cell.border    = row_border
+                cell.alignment = left_align
+                cell.fill      = alt_fill if is_alt else white_fill
+
+            # Colour the Category cell individually
+            cat_cell = ws.cell(row=row_idx, column=cat_col_idx)
+            cat_val  = str(cat_cell.value or "")
+            cat_cell.fill = cat_fills.get(cat_val, white_fill)
+            cat_cell.font = Font(bold=True, size=10)
+            cat_cell.alignment = center_align
+
+            # Right-align numeric Debit / Credit cells
+            for col_letter in ("E", "F"):
+                ws[f"{col_letter}{row_idx}"].alignment = Alignment(
+                    horizontal="right", vertical="center"
+                )
+
+        # Freeze top row
+        ws.freeze_panes = "A2"
+
     return output.getvalue()
 
 
