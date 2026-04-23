@@ -288,20 +288,27 @@ st.markdown("""
 # ─────────────────────────────────────────────
 
 # All known column name variants across Indian banks
-# (HDFC, SBI, ICICI, Axis, Kotak, Yes Bank, PNB, BOB, Canara…)
+# (HDFC, SBI, ICICI, Axis, Kotak, Yes Bank, PNB, BOB, Canara, federal…)
 DATE_KEYWORDS    = ["date", "dt", "txn date", "tran date", "value dt",
                     "value date", "posting date", "trans date", "transaction date"]
 DESC_KEYWORDS    = ["description", "narration", "particulars", "particular",
                     "narr", "desc", "details", "remarks", "transaction details",
-                    "transaction remarks", "chq", "ref"]
-DEBIT_KEYWORDS   = ["debit", "withdrawal", "withdraw", "dr", "debit amt",
+                    "transaction remarks"]
+DEBIT_KEYWORDS   = ["debit", "withdrawal", "withdraw", "debit amt",
                     "debit amount", "withdrawal amt", "amount debited",
                     "withdrawals", "paid out", "debit(inr)", "debit(₹)"]
-CREDIT_KEYWORDS  = ["credit", "deposit", "cr", "credit amt", "credit amount",
+CREDIT_KEYWORDS  = ["credit", "deposit", "credit amt", "credit amount",
                     "deposit amt", "amount credited", "deposits",
                     "paid in", "credit(inr)", "credit(₹)"]
 BALANCE_KEYWORDS = ["balance", "bal", "closing balance", "closing bal",
                     "running balance", "available balance", "ledger balance"]
+# Single signed-amount column (negative=Debit, positive=Credit)
+AMOUNT_KEYWORDS  = ["amount", "net amount", "net amt", "txn amount",
+                    "transaction amount", "amount(inr)", "tran amount",
+                    "debit/credit", "net transaction"]
+# Dr/Cr type indicator column
+DRCP_KEYWORDS    = ["dr/cr", "cr/dr", "type", "txn type", "transaction type",
+                    "d/c", "dc", "debit credit", "cr dr"]
 
 
 def _col_matches(col_text: str, keywords: list[str]) -> bool:
@@ -387,13 +394,15 @@ def _find_header(df: pd.DataFrame) -> int | None:
 
 
 def _assign_col(col_name: str) -> str | None:
-    """Map a raw column name to one of 5 standard names, or None to drop."""
+    """Map a raw column name to one of 7 standard names, or None to drop."""
     c = str(col_name).lower().strip()
     if _col_matches(c, DATE_KEYWORDS):    return "Date"
     if _col_matches(c, DESC_KEYWORDS):    return "Description"
     if _col_matches(c, DEBIT_KEYWORDS):   return "Debit"
     if _col_matches(c, CREDIT_KEYWORDS):  return "Credit"
     if _col_matches(c, BALANCE_KEYWORDS): return "Balance"
+    if _col_matches(c, AMOUNT_KEYWORDS):  return "SignedAmount"  # single ±amount col
+    if _col_matches(c, DRCP_KEYWORDS):    return "TxnType"       # Dr/Cr indicator col
     return None
 
 
@@ -414,25 +423,29 @@ def _extract_col_positions(df: pd.DataFrame, header_idx: int) -> dict[int, str]:
     return pos_map
 
 
+ALL_STD_COLS = ["Date", "Description", "Debit", "Credit",
+                "Balance", "SignedAmount", "TxnType"]
+
+
 def _apply_col_positions(df: pd.DataFrame,
                          pos_map: dict[int, str]) -> pd.DataFrame | None:
     """
-    Given a data DataFrame (no header row) and a column-position → standard-name
-    map, build a clean 5-column DataFrame.
+    Apply a column-position → standard-name map to a data DataFrame.
+    Returns a DataFrame with all 7 standard columns (missing ones = "").
     """
     result = {}
     for pos, std in pos_map.items():
-        if pos < len(df.columns):
+        if pos < len(df.columns) and std not in result:
             result[std] = df.iloc[:, pos].reset_index(drop=True)
     if "Date" not in result:
         return None
-    for req in ["Date", "Description", "Debit", "Credit", "Balance"]:
+    for req in ALL_STD_COLS:
         if req not in result:
             result[req] = ""
-    out = pd.DataFrame(result)[["Date", "Description", "Debit", "Credit", "Balance"]]
-    # Drop repeated header rows that some banks print on every page
+    out = pd.DataFrame(result)[ALL_STD_COLS]
+    # Drop repeated header rows printed on every page
     is_hdr = out["Date"].astype(str).str.lower().str.match(
-        r"^(date|dt|txn|tran|value|posting|sl\.)"
+        r"^(date|dt|txn|tran|value|posting|sl\.|s\.no)"
     )
     out = out[~is_hdr].dropna(how="all").reset_index(drop=True)
     return out if not out.empty else None
@@ -441,27 +454,27 @@ def _apply_col_positions(df: pd.DataFrame,
 def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
     """
     Strategy:
-    1. Scan ALL frames to find the best header row and learn the column layout.
-    2. Apply that SAME column-position map to every frame (including
-       continuation pages that have no header).
-    This ensures Debit/Credit/Balance are always mapped correctly on every page.
+    1. Scan ALL frames to find the best header and learn the column layout.
+    2. Accept layout even if it only has Date + SignedAmount (single-amount format).
+    3. Apply that SAME position map to every frame including continuation pages.
+    4. Concat and clean.
     """
-    # ── Step 1: find column layout from any frame that has a header ──────────
+    # ── Step 1: discover master column layout ────────────────────────────────
     master_pos_map: dict[int, str] | None = None
 
     for df in frames:
         h = _find_header(df)
         if h is not None:
             candidate = _extract_col_positions(df, h)
-            # Accept layout only if it has at least Date + one amount column
-            has_amount = any(v in ("Debit", "Credit") for v in candidate.values())
-            if candidate and has_amount:
+            vals = set(candidate.values())
+            # Accept if we have Date + any amount indicator
+            has_amount = bool(vals & {"Debit", "Credit", "SignedAmount"})
+            if candidate and "Date" in vals and has_amount:
                 master_pos_map = candidate
-                break   # first valid header wins
+                break
 
-    # ── Step 2: fall back to smart positional if no header found ─────────────
+    # ── Step 2: positional fallback ──────────────────────────────────────────
     if master_pos_map is None:
-        # Try the frame whose first column looks most like dates
         for df in frames:
             if df.empty or len(df.columns) < 3:
                 continue
@@ -470,12 +483,13 @@ def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
                 r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|^\d{4}[\/\-]\d{2}[\/\-]\d{2}"
             ).sum()
             if hits >= 2:
-                # Detect amount columns by checking which cols have numeric values
                 master_pos_map = _detect_amount_positions(df)
                 if master_pos_map:
                     break
         if not master_pos_map:
             return None
+
+    num_expected_cols = max(master_pos_map.keys()) + 1
 
     # ── Step 3: apply layout to every frame ──────────────────────────────────
     parts = []
@@ -483,7 +497,23 @@ def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
         try:
             h = _find_header(df)
             data = df.iloc[h + 1:].copy().reset_index(drop=True) if h is not None else df.copy()
-            norm = _apply_col_positions(data, master_pos_map)
+
+            # If column count mismatches by 1-2 (some banks omit Chq col on
+            # continuation pages), try shifting the map to align on Date col
+            if len(data.columns) != num_expected_cols and len(data.columns) >= 3:
+                # Re-detect via positional for this specific frame
+                first = data.iloc[:, 0].astype(str)
+                hits  = first.str.match(
+                    r"^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|^\d{4}[\/\-]\d{2}[\/\-]\d{2}"
+                ).sum()
+                if hits >= 2:
+                    local_map = _detect_amount_positions(data)
+                    norm = _apply_col_positions(data, local_map)
+                else:
+                    norm = None
+            else:
+                norm = _apply_col_positions(data, master_pos_map)
+
             if norm is not None and not norm.empty:
                 parts.append(norm)
         except Exception:
@@ -493,24 +523,22 @@ def normalize_raw_tables(frames: list[pd.DataFrame]) -> pd.DataFrame | None:
         return None
 
     combined = pd.concat(parts, ignore_index=True)
-    combined.columns = ["Date", "Description", "Debit", "Credit", "Balance"]
+    # Force exact column names regardless of what came through
+    if list(combined.columns) != ALL_STD_COLS:
+        combined = combined.reindex(columns=ALL_STD_COLS, fill_value="")
 
     # Drop rows where both Date and Description are empty/null
     d_empty = combined["Date"].astype(str).str.strip().isin(["", "None", "nan"])
-    r_empty = combined["Description"].astype(str).str.strip().isin(["", "None", "nan"])
-    combined = combined[~(d_empty & r_empty)].reset_index(drop=True)
+    n_empty = combined["Description"].astype(str).str.strip().isin(["", "None", "nan"])
+    combined = combined[~(d_empty & n_empty)].reset_index(drop=True)
 
     return combined if not combined.empty else None
 
 
 def _detect_amount_positions(df: pd.DataFrame) -> dict[int, str]:
     """
-    For PDFs with no header, infer column roles by checking which
-    columns contain mostly numeric values. Assigns:
-      col[0]  → Date  (already verified date-like)
-      col[1]  → Description (usually longest text)
-      last    → Balance  (running total, always non-zero)
-      numeric cols before last → Debit then Credit
+    For PDFs with no header, infer column roles by numeric density.
+    Also detects signed-amount columns (contain negative values).
     """
     pos_map: dict[int, str] = {0: "Date", 1: "Description"}
     n = len(df.columns)
@@ -519,25 +547,40 @@ def _detect_amount_positions(df: pd.DataFrame) -> dict[int, str]:
 
     def num_score(col_idx: int) -> float:
         vals = df.iloc[:, col_idx].astype(str)
-        numeric = vals.str.replace(r"[,₹\s]", "", regex=True).str.match(r"^\d+\.?\d*$")
+        numeric = vals.str.replace(r"[,₹\s\-\+\(\)]", "", regex=True).str.match(r"^\d+\.?\d*$")
         return numeric.sum() / max(len(vals), 1)
 
-    # Find columns with high numeric density (skip col 0 and 1)
+    def has_negatives(col_idx: int) -> bool:
+        vals = df.iloc[:, col_idx].astype(str).str.strip()
+        return vals.str.startswith("-").any() or vals.str.startswith("(").any()
+
     numeric_cols = sorted(
         [i for i in range(2, n) if num_score(i) > 0.3],
         key=lambda i: num_score(i), reverse=True
     )
 
-    if len(numeric_cols) >= 3:
-        # e.g. [Debit_col, Credit_col, Balance_col]
+    if not numeric_cols:
+        return pos_map
+
+    # Check if any numeric column has mixed +/- signs → single signed amount col
+    signed_cols = [i for i in numeric_cols if has_negatives(i)]
+
+    if signed_cols:
+        # Single signed-amount format: negative=Debit, positive=Credit
+        pos_map[signed_cols[0]] = "SignedAmount"
+        # Remaining high-numeric col is likely Balance
+        remaining = [i for i in numeric_cols if i != signed_cols[0]]
+        if remaining:
+            pos_map[remaining[-1]] = "Balance"
+    elif len(numeric_cols) >= 3:
         pos_map[numeric_cols[-1]] = "Balance"
         pos_map[numeric_cols[0]]  = "Debit"
         pos_map[numeric_cols[1]]  = "Credit"
     elif len(numeric_cols) == 2:
-        pos_map[numeric_cols[0]] = "Debit"
-        pos_map[numeric_cols[1]] = "Balance"
+        pos_map[numeric_cols[0]]  = "Debit"
+        pos_map[numeric_cols[1]]  = "Balance"
     elif len(numeric_cols) == 1:
-        pos_map[numeric_cols[0]] = "Debit"
+        pos_map[numeric_cols[0]]  = "Debit"
 
     return pos_map
 
@@ -555,29 +598,70 @@ def clean_amount(value) -> float:
         return 0.0
 
 
+def _parse_signed(raw: str) -> tuple[float, str] | None:
+    """
+    Parse a signed amount string into (magnitude, "Debit"/"Credit").
+    Negative or parenthesised → Debit. Positive → Credit.
+    Returns None if value is zero or unparseable.
+    """
+    s = str(raw).strip().replace(",", "").replace("₹", "").replace(" ", "")
+    if not s or s in ("nan", "None", "-", "+"):
+        return None
+    # Parenthesised negative: (1234.56)
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    is_neg = s.startswith("-")
+    magnitude = clean_amount(s)
+    if magnitude == 0.0:
+        return None
+    return (magnitude, "Debit" if is_neg else "Credit")
+
+
 def standardize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert raw columns into Date | Description | Amount | Type format.
-    Handles:
-    - Rows with only Debit filled (ICICI, Axis)
-    - Rows with only Credit filled
-    - Rows with both Debit and Credit in same row (HDFC style)
-    - Rows where a single Amount column exists with Dr/Cr suffix
+    Convert raw columns → Date | Description | Amount | Type.
+
+    Handles THREE formats:
+    ① Two-column  — separate Debit / Credit columns (ICICI, Axis, SBI)
+    ② Signed-amount — single Amount col, negative=Debit positive=Credit
+    ③ Amount + TxnType — single Amount col + Dr/Cr indicator column
     """
     rows = []
     for _, row in df.iterrows():
-        date_val = str(row.get("Date", "")).strip()
-        desc_val = str(row.get("Description", "")).strip()
+        date_val  = str(row.get("Date",        "")).strip()
+        desc_val  = str(row.get("Description", "")).strip()
         if not date_val or not desc_val:
             continue
+        if date_val in ("nan", "None") or desc_val in ("nan", "None"):
+            continue
 
+        base = {"Date": date_val, "Description": desc_val}
+
+        signed_raw = str(row.get("SignedAmount", "")).strip()
+        txntype_raw = str(row.get("TxnType", "")).strip().lower()
         debit  = clean_amount(row.get("Debit",  ""))
         credit = clean_amount(row.get("Credit", ""))
-        base   = {"Date": date_val, "Description": desc_val}
 
+        # ── Format ③: Amount column + Dr/Cr indicator ────────────────────────
+        if signed_raw and signed_raw not in ("", "nan", "None") and txntype_raw:
+            magnitude = clean_amount(signed_raw)
+            if magnitude > 0:
+                is_dr = (txntype_raw.startswith("d") or
+                         "dr" in txntype_raw or "debit" in txntype_raw or
+                         "withdrawal" in txntype_raw)
+                txn_type = "Debit" if is_dr else "Credit"
+                rows.append({**base, "Amount": magnitude, "Type": txn_type})
+            continue
+
+        # ── Format ②: Single signed amount (negative=Debit, positive=Credit) ─
+        if signed_raw and signed_raw not in ("", "nan", "None"):
+            parsed = _parse_signed(signed_raw)
+            if parsed:
+                rows.append({**base, "Amount": parsed[0], "Type": parsed[1]})
+            continue
+
+        # ── Format ①: Separate Debit / Credit columns ────────────────────────
         if debit > 0 and credit > 0:
-            # Both filled (some formats put the non-applicable as 0.00 but both exist)
-            # Use balance direction heuristic — just add both as separate entries
             rows.append({**base, "Amount": debit,  "Type": "Debit"})
             rows.append({**base, "Amount": credit, "Type": "Credit"})
         elif debit > 0:
